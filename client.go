@@ -1,7 +1,6 @@
 package grlrpc
 
 import (
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,8 +9,6 @@ import (
 	"log"
 	"net"
 	"sync"
-
-	"github.com/sqs/goreturns/returns"
 )
 
 
@@ -167,7 +164,90 @@ func newClientCodec(cc codec.Codec,opt * Option) *Client{
 	go client.receive()
 	return client
 }
-func (c * Client) send(){
+//转换option
+func parseOptions(opts ...*Option) (*Option,error){
+	if len(opts) == 0 || opts[0] == nil{
+		//默认为gob
+		return DefaultOption,nil
+	}
+	//给了大于1的opt时则报错
+	if len(opts) != 1{
+		return nil,errors.New("number of options is more than 1")
+	}
+	//opt为第一个opt
+	opt := opts[0]
+	opt.MagicNumber = DefaultOption.MagicNumber
+	if opt.CodecType == ""{
+		opt.CodecType = DefaultOption.CodecType
+	}
+	return opt,nil
+}
 
+func Dial(network,address string,opts ...*Option)(client *Client,err error)  {
+	opt,err := parseOptions(opts...)
+	if err != nil{
+		return nil,err
+	}
+
+	conn,err := net.Dial(network,address)
+	if err != nil{
+		return nil,err
+	}
+
+	defer func() {
+		if client == nil{
+			_ = conn.Close()
+		}
+	}()
+
+	return NewClient(conn,opt)
+}
+func (c * Client) send(call *Call){
+	//先对sending加锁
+	c.sending.Lock()
+	defer c.sending.Unlock()
+	//
+	seq,err := c.registerCall(call)
+
+	if err != nil{
+		call.Error = err
+		call.done()
+		return
+	}
+
+	c.header.ServiceMethod = call.ServiceMethod
+	c.header.Seq = seq
+	c.header.Error = ""
+
+	if err := c.cc.Write(&c.header,call.Args);err != nil{
+		call := c.removeCall(seq)
+
+		if call != nil{
+			call.Error = err
+			call.done()
+		}
+	}
+}
+
+func (c * Client) Go(serviceMethod string,args ,reply interface{},done chan *Call)  *Call{
+
+	if done == nil{
+		done = make(chan *Call,10)
+	}else if cap(done) == 0{
+		log.Panic("rpc client ：done channel is unbuffered")
+	}
+	call := &Call{
+		ServiceMethod: serviceMethod,
+		Args: args,
+		Reply: reply,
+		Done: done,
+	}
+	c.send(call)
+	return call
+}
+
+func (c * Client) Call(serviceMethod string,args,reply interface{})error  {
+	call := <-c.Go(serviceMethod,args,reply,make(chan *Call,1)).Done
+	return call.Error
 
 }
