@@ -2,13 +2,14 @@ package grlrpc
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	"go/ast"
 	"grlrpc/codec"
 	"io"
 	"log"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -25,8 +26,40 @@ var DefaultOption = &Option{
 	CodecType:   codec.GobType,
 }
 
-type Server struct {}
+type Server struct {
+	serviceMap sync.Map
+}
 
+func (server * Server) Register(rcvr interface{})  error{
+	s := newService(rcvr)
+	if _,dup:= server.serviceMap.LoadOrStore(s.name,s);dup{
+		return errors.New("rpc : service already defined:" + s.name)
+	}
+	return nil
+}
+func Register(rcvr interface{})  error{
+	return DefaultServer.Register(rcvr)
+
+}
+func (server * Server) findService(serviceMethod string)  (svc *service,mtype *methodType,err error){
+	dot := strings.LastIndex(serviceMethod,".")
+	if dot < 0{
+		err = errors.New("rpc server: service/method request ill-formed:" + serviceMethod)
+		return
+	}
+	serviceName , methodName := serviceMethod[:dot],serviceMethod[dot+1:]
+	svci,ok := server.serviceMap.Load(serviceName)
+	if !ok {
+		err = errors.New("rpc server : can't find service" + serviceName)
+		return
+	}
+	svc = svci.(*service)
+	mtype = svc.method[methodName]
+	if mtype == nil{
+		err = errors.New("rpc server : can't find method" + methodName)
+	}
+	return
+}
 func NewServer() *Server  {
 	return &Server{}
 }
@@ -57,7 +90,7 @@ func (s * Server) ServeConn(conn io.ReadWriteCloser)  {
 	}
 
 	if opt.MagicNumber != MagicNumber{
-		log.Print("rpc server : invalid magic number %x",opt.MagicNumber)
+		log.Printf("rpc server : invalid magic number %d", opt.MagicNumber)
 		return
 	}
 	//f是一个函数
@@ -97,7 +130,8 @@ func (s * Server) serveCodec(cc codec.Codec)  {
 type request struct {
 	h *codec.Header
 	argv,reply reflect.Value
-	
+	mtype *methodType
+	svc *service
 }
 
 func (s * Server) readRequestHeader(cc codec.Codec)  (*codec.Header,error){
@@ -118,10 +152,22 @@ func (s * Server) readRequest(cc codec.Codec)  (*request,error){
 		return nil, err
 	}
 	req := &request{h: h}
+	req.svc,req.mtype,err = s.findService(h.ServiceMethod)
+	if err != nil{
+		return req, err
+	}
 
-	req.argv = reflect.New(reflect.TypeOf(""))
-	if err = cc.ReadBody(req.argv.Interface()); err != nil{
+	req.argv = req.mtype.newArgv()
+	req.reply = req.mtype.newReplyv()
+
+	argvi := req.argv.Interface()
+	if req.argv.Type().Kind() != reflect.Ptr{
+		argvi = req.argv.Addr().Interface()
+	}
+
+	if err = cc.ReadBody(argvi); err != nil{
 		log.Println("rpc server : read argv err :",err)
+		return req, err
 	}
 	return req,nil
 }
@@ -136,8 +182,12 @@ func (s * Server) sendResponse(cc codec.Codec,h * codec.Header,body interface{},
 
 func (s * Server) handleRequest(cc codec.Codec,req * request,sending * sync.Mutex,wg *sync.WaitGroup)  {
 	defer wg.Done()
-	log.Println(req.h,req.argv.Elem())
-	req.reply = reflect.ValueOf(fmt.Sprintf("grlrpc resp %d",req.h.Seq))
+	err := req.svc.call(req.mtype,req.argv,req.reply)
+	if err != nil{
+		req.h.Error = err.Error()
+		s.sendResponse(cc,req.h,invalidRequest,sending)
+		return
+	}
 	s.sendResponse(cc,req.h,req.reply.Interface(),sending)
 
 }
@@ -196,6 +246,8 @@ func newService(rcvr interface{})  *service{
 		log.Fatalf("rpc server : %s is not a valid service name",s.name)
 	}
 	//注册方法
+	s.registerMethods()
+	return s
 }
 
 func (s * service)  registerMethods(){
@@ -210,8 +262,33 @@ func (s * service)  registerMethods(){
 			continue
 		}
 		argType,replyType := mType.In(1),mType.In(2)
-		//
+		if !isExportedOrBuiltinType(argType) || !isExportedOrBuiltinType(replyType){
+			continue
+		}
+
+		s.method[method.Name] = &methodType{
+			method: method,
+			ArgType: argType,
+			ReplyType: replyType,
+		}
+
+		log.Printf("rpc server : register %s.%s\n",s.name,method.Name)
 	}
-	
+}
+
+func isExportedOrBuiltinType(t reflect.Type)  bool{
+	return ast.IsExported(t.Name()) || t.PkgPath() == ""
+}
+
+func (s * service) call(m *methodType,argv,replyv reflect.Value) error  {
+	atomic.AddUint64(&m.numCalls,1)
+	f := m.method.Func
+
+	returnValues := f.Call([]reflect.Value{s.rcvr,argv,replyv})
+
+	if errInter := returnValues[0].Interface();  errInter != nil{
+		return errInter.(error)
+	}
+	return nil
 }
 
